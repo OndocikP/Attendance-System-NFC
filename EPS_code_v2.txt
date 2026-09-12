@@ -1,0 +1,211 @@
+#include <Wire.h>
+#include <Adafruit_PN532.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <esp_log.h>
+
+// PN532 cez I2C na ESP32-C3 SuperMini
+#define I2C_SDA 6
+#define I2C_SCL 7
+#define LED_PIN 8
+
+#define WIFI_NAME "****"
+#define WIFI_PASSWORD "****"
+
+#define SUPABASE_URL "****"
+#define SUPABASE_KEY "****"
+
+#define LED_ON HIGH
+#define LED_OFF LOW
+
+// Tato verzia kniznice vyzaduje IRQ/RESET v konstruktore,
+// ale pri I2C ich nemusis fyzicky pripajat.
+#define PN532_IRQ_DUMMY 4
+#define PN532_RESET_DUMMY 5
+
+Adafruit_PN532 nfc(PN532_IRQ_DUMMY, PN532_RESET_DUMMY, &Wire);
+
+String uidToString(const uint8_t *uid, uint8_t uidLength) {
+  String out;
+  for (uint8_t i = 0; i < uidLength; i++) {
+    if (uid[i] < 0x10) {
+      out += "0";
+    }
+    out += String(uid[i], HEX);
+    if (i < uidLength - 1) {
+      out += ":";
+    }
+  }
+  out.toUpperCase();
+  return out;
+}
+
+String readFirstCardBlock(uint8_t *uid, uint8_t uidLength) {
+  uint8_t defaultKeyA[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  uint8_t blockData[16];
+
+  Serial.println("\nNacitavam prvy blok karty...");
+
+  if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 0, 0, defaultKeyA)) {
+    Serial.println("Autentizacia prveho bloku zlyhala.");
+    return "";
+  }
+
+  if (!nfc.mifareclassic_ReadDataBlock(0, blockData)) {
+    Serial.println("Citanie prveho bloku zlyhalo.");
+    return "";
+  }
+
+  String blockText = "";
+  for (uint8_t i = 0; i < 16; i++) {
+    if (blockData[i] < 0x10) {
+      blockText += "0";
+    }
+    blockText += String(blockData[i], HEX);
+    if (i < 15) {
+      blockText += ":";
+    }
+  }
+
+  Serial.print("Prvy blok: ");
+  Serial.println(blockText);
+  return blockText;
+}
+
+bool callNewLog(const String &cardUid, const String &cardData) {
+  if (String(SUPABASE_URL).length() == 0 || String(SUPABASE_KEY).length() == 0) {
+    Serial.println("Supabase nie je nastavena (SUPABASE_URL/SUPABASE_KEY).");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String endpoint = String(SUPABASE_URL) + "/rest/v1/rpc/new_log";
+  if (!http.begin(client, endpoint)) {
+    Serial.println("HTTP begin zlyhal.");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_KEY);
+
+  String payload = String("{\"p_card_uid\":\"") + cardData + "\",\"p_text\":\"NFC scan\"}";
+
+  int httpCode = http.POST(payload);
+  String response = http.getString();
+  http.end();
+
+  Serial.print("Supabase HTTP code: ");
+  Serial.println(httpCode);
+  Serial.print("Supabase response: ");
+  Serial.println(response);
+
+  if (httpCode == 401 || httpCode == 403) {
+    Serial.println("RLS/Auth chyba: pre RPC new_log treba policy alebo SECURITY DEFINER funkciu.");
+  }
+
+  return (httpCode >= 200 && httpCode < 300);
+}
+
+bool ensureWiFiConnected() {
+  static unsigned long lastBlinkMs = 0;
+  static unsigned long lastConnectTryMs = 0;
+  static bool ledState = false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_PIN, LED_OFF);
+    return true;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastConnectTryMs >= 5000) {
+    Serial.print("Pripajam na WiFi: ");
+    Serial.println(WIFI_NAME);
+    WiFi.begin(WIFI_NAME, WIFI_PASSWORD);
+    lastConnectTryMs = now;
+  }
+
+  if (now - lastBlinkMs >= 500) {
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
+    lastBlinkMs = now;
+  }
+
+  return false;
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {
+    delay(10);
+  }
+
+  Serial.println();
+  Serial.println("ESP32-C3 + PN532: citanie NFC kariet");
+  Serial.println("Zapojenie: SDA=GPIO6, SCL=GPIO7");
+
+  // Potlaci hlucne i2c.driver logy pri timeoutoch, ktore sa pri polling citacky
+  // mozu objavovat aj ked citacka normalne funguje.
+  esp_log_level_set("i2c.master", ESP_LOG_NONE);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LED_OFF);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_NAME, WIFI_PASSWORD);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);
+  nfc.begin();
+
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    Serial.println("PN532 nebola najdena. Skontroluj zapojenie a I2C piny.");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  Serial.print("PN532 firmware: ");
+  Serial.print((versiondata >> 16) & 0xFF, DEC);
+  Serial.print('.');
+  Serial.println((versiondata >> 8) & 0xFF, DEC);
+
+  nfc.SAMConfig();
+  Serial.println("System pripraveny.");
+}
+
+void loop() {
+  if (!ensureWiFiConnected()) {
+    return;
+  }
+
+  uint8_t uid[7];
+  uint8_t uidLength;
+
+  // Nepretrzite cita pasivnu NFC kartu
+  bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 150);
+
+  if (success) {
+    String uidText = uidToString(uid, uidLength);
+    Serial.print("Karta detekovana, UID: ");
+    Serial.println(uidText);
+
+    String cardData = readFirstCardBlock(uid, uidLength);
+    Serial.print("Prvy blok sa posle ako card_id: ");
+    Serial.println(cardData);
+
+    digitalWrite(LED_PIN, LED_ON);
+    callNewLog(uidText, cardData);
+    delay(1000);
+    digitalWrite(LED_PIN, LED_OFF);
+  } else {
+    delay(30);
+  }
+}
