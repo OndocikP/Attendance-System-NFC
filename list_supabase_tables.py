@@ -1,5 +1,5 @@
 import os
-from typing import List, Set
+from typing import Dict, List, Set
 
 import requests
 from dotenv import load_dotenv
@@ -12,13 +12,25 @@ def get_env(name: str) -> str:
     return value
 
 
-def fetch_table_names(supabase_url: str, api_key: str) -> List[str]:
-    endpoint = f"{supabase_url.rstrip('/')}/rest/v1/"
-    headers = {
+def get_api_key() -> str:
+    key = os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SERVICE_ROL") or os.getenv("SUPABASE_PUBLISHABLE_KEY")
+    if not key:
+        raise RuntimeError(
+            "Missing API key. Set SUPABASE_SECRET_KEY or SERVICE_ROL or SUPABASE_PUBLISHABLE_KEY in .env"
+        )
+    return key
+
+
+def build_headers(api_key: str) -> Dict[str, str]:
+    return {
         "apikey": api_key,
         "Authorization": f"Bearer {api_key}",
-        "Accept": "application/openapi+json",
     }
+
+
+def fetch_table_names(supabase_url: str, api_key: str) -> List[str]:
+    endpoint = f"{supabase_url.rstrip('/')}/rest/v1/"
+    headers = {**build_headers(api_key), "Accept": "application/openapi+json"}
 
     response = requests.get(endpoint, headers=headers, timeout=20)
     response.raise_for_status()
@@ -43,55 +55,48 @@ def fetch_table_names(supabase_url: str, api_key: str) -> List[str]:
     return sorted(table_names)
 
 
-def call_new_log(supabase_url: str, api_key: str, user_id: str, log_text: str) -> None:
-    endpoint = f"{supabase_url.rstrip('/')}/rest/v1/rpc/new_log"
-    headers = {
-        "apikey": api_key,
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+def fetch_rows(supabase_url: str, api_key: str, table_name: str, limit: int) -> List[Dict[str, object]]:
+    endpoint = f"{supabase_url.rstrip('/')}/rest/v1/{table_name}"
+    headers = build_headers(api_key)
+    params = {
+        "select": "*",
+        "limit": str(limit),
     }
-    payload = {
-        "p_card_uid": user_id,
-        "p_text": log_text,
-    }
-    response = requests.post(endpoint, headers=headers, json=payload, timeout=20)
+
+    response = requests.get(endpoint, headers=headers, params=params, timeout=20)
     response.raise_for_status()
-    print("Successfully called public.new_log")
-    if response.content:
-        try:
-            print("RPC result:", response.json())
-        except ValueError:
-            print("RPC result:", response.text)
-    else:
-        print("RPC result: <empty response>")
+    data = response.json()
+    if isinstance(data, list):
+        return data
+    return []
 
 
 def main() -> None:
     load_dotenv()
 
     supabase_url = get_env("SUPABASE_URL")
-    api_key = os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SERVICE_ROL") or os.getenv("SUPABASE_PUBLISHABLE_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "Missing API key. Set SUPABASE_SECRET_KEY or SERVICE_ROL or SUPABASE_PUBLISHABLE_KEY in .env"
-        )
+    api_key = get_api_key()
 
-    tables = fetch_table_names(supabase_url, api_key)
+    table_name = os.getenv("SUPABASE_TABLE")
+    limit_raw = os.getenv("SUPABASE_LIMIT", "10")
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        limit = 10
+    limit = max(1, min(limit, 500))
 
-    if not tables:
-        print("No table endpoints were found in the exposed Supabase REST schema.")
+    if not table_name:
+        tables = fetch_table_names(supabase_url, api_key)
+        print("Available tables:")
+        for name in tables:
+            print(f"- {name}")
+        print("\nSet SUPABASE_TABLE in .env and run again to fetch rows.")
         return
 
-    print("Supabase table names:")
-    for name in tables:
-        print(f"- {name}")
-
-    call_new_log(
-        supabase_url=supabase_url,
-        api_key=api_key,
-        user_id="550e8400-e29b-41d4-a716-446655440000",
-        log_text="Python test",
-    )
+    rows = fetch_rows(supabase_url, api_key, table_name, limit)
+    print(f"Rows from '{table_name}' (limit {limit}):")
+    for row in rows:
+        print(row)
 
 
 if __name__ == "__main__":
